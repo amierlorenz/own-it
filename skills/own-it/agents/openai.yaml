@@ -1,0 +1,5 @@
+interface:
+  display_name: "Own it"
+  short_description: "Make a code change you can explain line by line: you plan, Claude types, you predict and explain"
+policy:
+  allow_implicit_invocation: false

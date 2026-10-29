@@ -6,12 +6,16 @@
     "url": "https://github.com/amierlorenz"
   },
   "repository": "https://github.com/amierlorenz/own-it",
-  "keywords": [
-    "learning",
-    "open-source",
-    "code-review",
-    "hooks",
-    "tutor"
-  ],
-  "license": "MIT"
+  "keywords": ["learning", "open-source", "code-review", "hooks", "tutor"],
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "style": {
+      "type": "string",
+      "title": "Task display",
+      "description": "band: a row above the prompt with questions, plan and review buttons. hint: one line at the end of the hint line under the prompt.",
+      "options": ["band", "hint"],
+      "default": "band"
+    }
+  }
 }

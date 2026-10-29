@@ -1,0 +1,321 @@
+#!/bin/bash
+# own-it: the state machine behind the own-it plugin. The only writer of .own-it/state.json.
+# The guard hook asks the user before any command here that moves a phase or records a prediction.
+#
+#   own-it [-C <dir>] start "<task>"     begin a task (archives the previous one)
+#   own-it status [--json]               where you are
+#   own-it next                          move to the next phase, if its gate passes
+#   own-it back                          return to the previous phase (review/explain/done go back to execute)
+#   own-it step <n>                      make step <n> of plan.md current (execute only)
+#   own-it predict "<text>"              record the user's prediction for the next run
+#   own-it run -- <command...>           run a check against the prediction and log the result
+#   own-it chunks                        list the diff's chunks, numbered as the teach-back uses them
+#   own-it skip "<reason>"               move to the next phase without its gate (logged)
+#   own-it off                           stop guarding this repo
+#   own-it rubric                        print the rubric file in use
+set -o pipefail
+
+ROOT_OF_PLUGIN=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PHASES=(recon plan execute review explain done)
+HINT_AFTER=${OWN_IT_HINT_AFTER:-3}
+
+die() { echo "own-it: $*" >&2; exit 1; }
+
+dir=.
+[ "$1" = -C ] && { dir=$2; shift 2; }
+root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repo."
+O=$root/.own-it S=$O/state.json
+
+get() { jq -r "$1 // empty" "$S" 2>/dev/null; }
+set_state() { # jq filter, then --arg/--argjson pairs
+  local f=$1; shift
+  jq "$@" "$f" "$S" > "$S.tmp" && mv "$S.tmp" "$S"
+}
+log() { printf -- '- %s · %s\n' "$(date '+%Y-%m-%d %H:%M')" "$*" >> "$O/log.md"; }
+active() { [ -f "$S" ] && [ "$(get .phase)" != off ]; }
+need_active() { active || die "no task in progress here. Start one with: own-it start \"<task>\""; }
+
+rubric_path() {
+  local mine=${XDG_CONFIG_HOME:-$HOME/.config}/amierlorenz-skills/own-it.md
+  [ -f "$mine" ] && echo "$mine" || echo "$ROOT_OF_PLUGIN/rubric.example.md"
+}
+
+# The commit the diff is measured against: HEAD, or the empty tree in a repo with no commits yet.
+base() { git -C "$root" rev-parse -q --verify HEAD >/dev/null && echo HEAD || git -C "$root" hash-object -t tree /dev/null; }
+
+chunk_list() { # "<n>. <file> @@ -a,b +c,d @@" per hunk, then one line per new untracked file
+  { git -C "$root" diff "$(base)" --no-color --no-ext-diff |
+      awk '/^diff --git /{f=$NF; sub(/^b\//,"",f)} /^@@ /{print f " " $1 " " $2 " " $3 " " $4}'
+    # New files count once each; binaries (build output, caches) aren't something to explain.
+    git -C "$root" ls-files --others --exclude-standard | while read -r f; do
+      [ ! -s "$root/$f" ] || grep -Iq . "$root/$f" && echo "$f (new file)"
+    done
+  } | awk '{print NR ". " $0}'
+}
+
+diff_hash() {
+  { git -C "$root" diff "$(base)" --no-color --no-ext-diff
+    git -C "$root" ls-files --others --exclude-standard -z | (cd "$root" && xargs -0 -r git hash-object --)
+  } | git hash-object --stdin
+}
+
+# Text under a markdown heading, minus <!-- comments --> and blank lines.
+section() { # file, heading regex
+  awk -v h="$2" '
+    /^## / { on = ($0 ~ "^## " h) ; next }
+    on' "$1" | sed 's/<!--.*-->//g' | grep -v '^[[:space:]]*$'
+}
+
+map_gaps() {
+  local s gaps=()
+  for s in Entry Path "Blast radius" Data "Safety net"; do
+    [ -n "$(section "$O/map.md" "$s")" ] || gaps+=("$s")
+  done
+  local IFS=,; echo "${gaps[*]}"
+}
+
+step_title() { grep -m1 -E "^## Step $1:" "$O/plan.md" | sed -E "s/^## Step $1:[[:space:]]*//"; }
+step_files() { # json array of the step's Files: entries
+  awk -v n="$1" '
+    $0 ~ "^## Step " n ":" { on = 1; next }
+    /^## / { on = 0 }
+    on && /^Files:/ { sub(/^Files:[[:space:]]*/, ""); print; exit }' "$O/plan.md" |
+    tr ',' '\n' | sed -E 's/^[[:space:]`]+|[[:space:]`]+$//g' | grep -v -e '^$' -e '^<' |
+    jq -R . | jq -sc .
+}
+
+q_count() { grep -cE "^- \[$1\] " "$O/questions.md" 2>/dev/null; }
+
+# Teach-back entries with What, Why and Alternative all filled in.
+explained() {
+  [ -f "$O/decisions.md" ] || { echo 0; return; }
+  awk '
+    /^### [0-9]+\./ { if (n) done += (w && y && a); n++; w = y = a = 0; next }
+    /^What:[[:space:]]*[^[:space:]]/ { w = 1 }
+    /^Why:[[:space:]]*[^[:space:]]/ { y = 1 }
+    /^Alternative:[[:space:]]*[^[:space:]]/ { a = 1 }
+    END { if (n) done += (w && y && a); print done + 0 }' "$O/decisions.md"
+}
+
+write_decisions() {
+  { echo "# Teach-back: $(get .task)"
+    echo
+    echo "<!-- One entry per chunk, in your words. Claude asks; you answer; Claude writes down what you said. -->"
+    chunk_list | while read -r line; do
+      printf '\n### %s\nWhat:\nWhy:\nAlternative:\n' "$line"
+    done
+  } > "$O/decisions.md"
+}
+
+start() {
+  local task=$1
+  [ -n "$task" ] || die 'usage: own-it start "<task>"'
+  if [ -f "$S" ]; then
+    local old; old=$O/archive/$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$old" && find "$O" -maxdepth 1 -type f -exec mv {} "$old/" \;
+    echo "Archived the previous task to ${old#"$root"/}"
+  fi
+  mkdir -p "$O"
+  # Never committed, without touching a tracked .gitignore: the clone's own exclude file.
+  local ex; ex=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir)/info/exclude
+  mkdir -p "$(dirname "$ex")"
+  grep -qsxF '/.own-it/' "$ex" || echo '/.own-it/' >> "$ex"
+
+  jq -n --arg t "$task" '{task:$t, phase:"recon", step:0, files:[], fails:0, prediction:null,
+    lastExit:null, diff:null, skips:0}' > "$S"
+  cat > "$O/map.md" <<EOF
+# System map: $task
+
+Only what this change touches. A module that isn't on the path or in the blast radius stays out.
+
+## Entry
+<!-- Where the behavior you're changing starts: a route, command, event or function. -->
+
+## Path
+<!-- The call chain from the entry to the code you'll change. -->
+
+## Blast radius
+<!-- Who else calls or depends on what you'll modify. -->
+
+## Data
+<!-- State or data this path reads or writes. -->
+
+## Safety net
+<!-- Tests that already cover this path, and the command that runs them. -->
+EOF
+  cat > "$O/plan.md" <<EOF
+# Plan: $task
+
+<!-- Your plan, in your words. One step at a time: Claude implements only the current step.
+Each step looks like this (without the indent):
+
+    ## Step 1: what you'll change
+    Files: path/to/file.py, tests/test_file.py
+    Why: what you think needs to happen, and why
+-->
+EOF
+  cat > "$O/questions.md" <<'EOF'
+# Questions
+
+<!-- Write what you don't know yet, before you look it up. You close them, not Claude.
+One line each (without the indent). Say how you found the answer: read the code, ran it, or were told.
+
+    - [ ] open question
+    - [x] answered question → the answer (read | ran | told)
+    - [~] obsolete question → why it no longer matters
+-->
+EOF
+  echo "# Log: $task" > "$O/log.md"
+  log "start: $task"
+  echo "Started: $task"
+  echo "Phase: recon. Map the change in .own-it/map.md, and write questions in .own-it/questions.md."
+}
+
+load_step() { # n
+  local n=$1 files
+  [ -n "$(step_title "$n")" ] || die "plan.md has no '## Step $n:' heading."
+  files=$(step_files "$n")
+  [ "$files" != "[]" ] || die "Step $n has no 'Files:' line. List the files this step may change."
+  set_state '.step=$n | .files=$f | .fails=0 | .prediction=null | .lastExit=null' --argjson n "$n" --argjson f "$files"
+  log "step $n: $(step_title "$n") ($(jq -r 'join(", ")' <<<"$files"))"
+}
+
+goto() { set_state '.phase=$p' --arg p "$1"; log "phase → $1${2:+ ($2)}"; echo "Phase: $1"; }
+
+next_phase() {
+  local p i; p=$(get .phase)
+  for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = "$p" ] && { echo "${PHASES[$((i + 1))]}"; return; }; done
+}
+
+gate() { # prints why the current phase can't advance, or nothing
+  case $(get .phase) in
+    recon)
+      local g; g=$(map_gaps)
+      [ -z "$g" ] || echo "map.md still needs: $g." ;;
+    plan)
+      grep -qE '^## Step 1:' "$O/plan.md" || echo "plan.md needs a '## Step 1:' heading with a Files: line."
+      [ "$(step_files 1 2>/dev/null)" != "[]" ] || echo "Step 1 needs a Files: line." ;;
+    execute)
+      local n=$(( $(get .step) + 1 ))
+      [ -z "$(step_title $n)" ] || echo "plan.md has a Step $n. Move to it with: own-it step $n (or remove it if the plan changed)."
+      [ "$(get .lastExit)" = 0 ] || echo "The last run must pass first. Predict, then: own-it run -- <check>" ;;
+    review)
+      grep -qE '^Result:[[:space:]]*pass' "$O/review.md" 2>/dev/null ||
+        echo "review.md doesn't say 'Result: pass' yet. Below 3 on any criterion goes back to execute: own-it back" ;;
+    explain)
+      local open total done
+      open=$(q_count ' '); total=$(chunk_list | wc -l | tr -d ' '); done=$(explained)
+      [ "$(diff_hash)" = "$(get .diff)" ] || echo "The code changed after review. Go back to execute, then review again."
+      [ "$open" = 0 ] || echo "$open open question(s) in questions.md. Answer them or mark them obsolete with a reason."
+      [ "$done" -ge "$total" ] || echo "Teach-back: $done of $total chunks explained." ;;
+    done) echo "Done. Commit, or start the next task with: own-it start \"<task>\"" ;;
+  esac
+}
+
+advance() { # $1 = reason when skipping
+  local p n; p=$(get .phase); n=$(next_phase)
+  [ -n "$n" ] || die "$(gate)"
+  case $n in
+    execute) load_step 1 ;;
+    explain)
+      set_state '.diff=$h' --arg h "$(diff_hash)"
+      write_decisions
+      echo "Wrote .own-it/decisions.md with $(chunk_list | wc -l | tr -d ' ') chunk(s) to explain." ;;
+  esac
+  goto "$n" "$1"
+}
+
+cmd_status() {
+  need_active
+  local p; p=$(get .phase)
+  local total=0 done=0
+  if [ "$p" = explain ] || [ "$p" = done ]; then total=$(chunk_list | wc -l | tr -d ' '); done=$(explained); fi
+  local fails; fails=$(get .fails); fails=${fails:-0}
+  local hint=0; [ "$fails" -ge "$HINT_AFTER" ] && hint=$((fails - HINT_AFTER + 1)); [ $hint -gt 3 ] && hint=3
+  if [ "$1" = --json ]; then
+    local qs scores result
+    qs=$(grep -E '^- \[[ x~]\] ' "$O/questions.md" 2>/dev/null |
+      sed -E 's/^- \[(.)\] /\1\t/' | jq -R 'split("\t") | {state: (.[0] | if . == "x" then "answered" elif . == "~" then "obsolete" else "open" end), text: .[1]}' | jq -sc .)
+    scores=$(grep -E '^\|[^|]+\|[[:space:]]*([1-4]|N/A)[[:space:]]*\|' "$O/review.md" 2>/dev/null |
+      awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/, "", $2); gsub(/^[ \t]+|[ \t]+$/, "", $3); print $2 "\t" $3}' |
+      jq -R 'split("\t") | {name: .[0], score: .[1]}' | jq -sc .)
+    result=$(grep -m1 -oE '^Result:[[:space:]]*[a-z]+' "$O/review.md" 2>/dev/null | sed -E 's/^Result:[[:space:]]*//')
+    jq -c --arg title "$(step_title "$(get .step)" 2>/dev/null)" --argjson qs "${qs:-[]}" --argjson scores "${scores:-[]}" \
+      --arg result "$result" --argjson total "$total" --argjson done "$done" --argjson hint "$hint" \
+      --arg folder "$(basename "$root")" --arg rubric "$(rubric_path)" --arg gate "$(gate | paste -sd ' ' -)" \
+      '{active: true, folder: $folder, gate: $gate, task, phase, step, stepTitle: $title, files, prediction, fails, hint: $hint,
+        lastExit, questions: $qs, chunks: {done: $done, total: $total},
+        review: {result: $result, scores: $scores}, skips, rubric: $rubric}' "$S"
+    return
+  fi
+  echo "Task:  $(get .task)"
+  echo "Phase: $p"
+  if [ "$p" = execute ]; then
+    echo "Step:  $(get .step): $(step_title "$(get .step)")"
+    echo "Files: $(jq -r '.files | join(", ")' "$S")"
+    local pred; pred=$(get .prediction); echo "Prediction: ${pred:-(none yet)}"
+    echo "Failed runs this step: $fails (hint level $hint of 3, unlocks after $HINT_AFTER)"
+  fi
+  echo "Questions: $(q_count ' ') open, $(q_count x) answered ($(grep -cE '^- \[x\] .*\(told\)' "$O/questions.md") told), $(q_count '~') obsolete"
+  [ "$total" -gt 0 ] && echo "Teach-back: $done of $total chunks"
+  local g; g=$(gate); [ -n "$g" ] && echo "Next gate: $g"
+  echo "Rubric: $(rubric_path)"
+}
+
+cmd=$1; shift || true
+case $cmd in
+  start) start "$*" ;;
+  status) cmd_status "$@" ;;
+  next)
+    need_active
+    g=$(gate); [ -z "$g" ] || die "$g"
+    advance ;;
+  skip)
+    need_active
+    [ -n "$*" ] || die 'usage: own-it skip "<reason>". Skipping is allowed, but it is logged with your reason.'
+    set_state '.skips += 1'; log "SKIP $(get .phase) gate: $*"
+    advance "skipped: $*" ;;
+  back)
+    need_active
+    case $(get .phase) in
+      recon) die "already at the first phase." ;;
+      plan) goto recon ;;
+      execute) goto plan ;;
+      *) goto execute ;;
+    esac ;;
+  step)
+    need_active
+    [ "$(get .phase)" = execute ] || die "steps change in execute. Phase is $(get .phase)."
+    [[ $1 =~ ^[0-9]+$ ]] || die "usage: own-it step <n>"
+    load_step "$1"
+    echo "Step $1: $(step_title "$1")"
+    echo "Files: $(jq -r '.files | join(", ")' "$S")" ;;
+  predict)
+    need_active
+    [ "$(get .phase)" = execute ] || die "predictions belong to execute. Phase is $(get .phase)."
+    [ -n "$*" ] || die 'usage: own-it predict "<what the user expects to happen>"'
+    set_state '.prediction=$p' --arg p "$*"
+    log "step $(get .step) prediction: $*"
+    echo "Prediction recorded. Run the check with: own-it run -- <command>" ;;
+  run)
+    need_active
+    [ "$1" = -- ] && shift
+    [ $# -gt 0 ] || die "usage: own-it run -- <command...>"
+    pred=$(get .prediction)
+    [ -n "$pred" ] || die "no prediction yet. Ask the user what they expect, then: own-it predict \"<their words>\""
+    out=$(mktemp); trap 'rm -f "$out"' EXIT
+    "$@" 2>&1 | tee "$out"; code=${PIPESTATUS[0]}
+    set_state '.prediction=null | .lastExit=$c | .fails += (if $c == 0 then 0 else 1 end)' --argjson c "$code"
+    { log "step $(get .step) run: \`$*\` → exit $code"
+      printf '  - predicted: %s\n  - last lines:\n' "$pred"
+      tail -n 15 "$out" | sed 's/^/        /'
+    } >> "$O/log.md"
+    echo
+    echo "own-it: exit $code. The user predicted: $pred"
+    echo "own-it: ask them how that compares to what happened, before explaining anything." ;;
+  chunks) need_active; chunk_list ;;
+  off) [ -f "$S" ] || die "no task here."; set_state '.phase="off"'; log "off"; echo "own-it is off for this repo. Start again with: own-it start \"<task>\"" ;;
+  rubric) rubric_path ;;
+  ""|-h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$cmd'. Try: own-it help" ;;
+esac

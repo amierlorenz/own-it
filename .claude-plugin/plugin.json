@@ -1,0 +1,17 @@
+{
+  "name": "own-it",
+  "description": "Own every line of an AI-assisted change: you map, plan, predict and explain; Claude types exactly what you ask and tutors. Enforced by hooks.",
+  "author": {
+    "name": "Amier",
+    "url": "https://github.com/amierlorenz"
+  },
+  "repository": "https://github.com/amierlorenz/own-it",
+  "keywords": [
+    "learning",
+    "open-source",
+    "code-review",
+    "hooks",
+    "tutor"
+  ],
+  "license": "MIT"
+}
